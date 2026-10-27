@@ -1176,6 +1176,10 @@ impl Default for ConnectionManager {
 /// one relay pod. See [`AppState::thread_summary_refresh`].
 pub const THREAD_SUMMARY_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Upper bound on one live thread-summary refresh (DB read, Redis publish,
+/// local fan-out). A hung refresh is abandoned so its root keeps emitting.
+pub const THREAD_SUMMARY_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Shared application state, cloned cheaply via inner `Arc` fields.
 #[derive(Clone)]
 pub struct AppState {
@@ -1594,6 +1598,7 @@ impl AppState {
             thread_summary_refresh: Arc::new(
                 crate::handlers::coalesced_refresh::CoalescedRefresh::new(
                     THREAD_SUMMARY_REFRESH_INTERVAL,
+                    THREAD_SUMMARY_REFRESH_TIMEOUT,
                 ),
             ),
             observer_owner_cache: Arc::new(

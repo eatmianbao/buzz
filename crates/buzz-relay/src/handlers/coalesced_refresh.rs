@@ -3,7 +3,8 @@
 //! A refresh for a key runs at once when none is in flight. Requests that
 //! arrive while one is running or cooling down collapse into one trailing
 //! rerun, so a key refreshes at most once per interval per process and the
-//! last request is always covered by a refresh that started after it.
+//! last request is always covered by a refresh that started after it. Each
+//! run is bounded by a timeout, so a hung refresh can't wedge its key.
 
 use std::future::Future;
 use std::hash::Hash;
@@ -18,17 +19,20 @@ use dashmap::DashMap;
 pub struct CoalescedRefresh<K> {
     pending: DashMap<K, bool>,
     min_interval: Duration,
+    run_timeout: Duration,
 }
 
 impl<K> CoalescedRefresh<K>
 where
     K: Eq + Hash + Clone + Send + Sync + 'static,
 {
-    /// A coalescer that refreshes each key at most once per `min_interval`.
-    pub fn new(min_interval: Duration) -> Self {
+    /// A coalescer that refreshes each key at most once per `min_interval`,
+    /// abandoning any single run that takes longer than `run_timeout`.
+    pub fn new(min_interval: Duration, run_timeout: Duration) -> Self {
         Self {
             pending: DashMap::new(),
             min_interval,
+            run_timeout,
         }
     }
 
@@ -58,7 +62,15 @@ where
                 key: Some(key.clone()),
             };
             loop {
-                refresh().await;
+                if tokio::time::timeout(this.run_timeout, refresh())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        timeout_ms = this.run_timeout.as_millis() as u64,
+                        "coalesced refresh timed out"
+                    );
+                }
                 tokio::time::sleep(this.min_interval).await;
                 if !this.rerun_or_release(&key) {
                     break;
@@ -105,6 +117,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const INTERVAL: Duration = Duration::from_secs(1);
+    const TIMEOUT: Duration = Duration::from_secs(5);
 
     fn counting(runs: &Arc<AtomicUsize>) -> impl Fn() -> std::future::Ready<()> + Send + 'static {
         let runs = Arc::clone(runs);
@@ -123,7 +136,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn burst_runs_once_now_and_once_trailing_then_frees_the_key() {
-        let refresh = Arc::new(CoalescedRefresh::new(INTERVAL));
+        let refresh = Arc::new(CoalescedRefresh::new(INTERVAL, TIMEOUT));
         let runs = Arc::new(AtomicUsize::new(0));
 
         for _ in 0..100 {
@@ -156,7 +169,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn keys_refresh_independently() {
-        let refresh = Arc::new(CoalescedRefresh::new(INTERVAL));
+        let refresh = Arc::new(CoalescedRefresh::new(INTERVAL, TIMEOUT));
         let runs = Arc::new(AtomicUsize::new(0));
 
         refresh.request("a", counting(&runs));
@@ -167,10 +180,30 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn panicking_refresh_releases_the_key() {
-        let refresh = Arc::new(CoalescedRefresh::new(INTERVAL));
+        let refresh = Arc::new(CoalescedRefresh::new(INTERVAL, TIMEOUT));
         refresh.request("root", || async { panic!("refresh failed") });
         settle().await;
         assert!(refresh.pending.is_empty(), "panic must not wedge the key");
+
+        let runs = Arc::new(AtomicUsize::new(0));
+        refresh.request("root", counting(&runs));
+        settle().await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hung_refresh_times_out_and_releases_the_key() {
+        let refresh = Arc::new(CoalescedRefresh::new(INTERVAL, TIMEOUT));
+        refresh.request("root", std::future::pending::<()>);
+        settle().await;
+        assert!(!refresh.pending.is_empty(), "the hung run holds the key");
+
+        tokio::time::advance(TIMEOUT + INTERVAL).await;
+        settle().await;
+        assert!(
+            refresh.pending.is_empty(),
+            "a hung run must not wedge the key"
+        );
 
         let runs = Arc::new(AtomicUsize::new(0));
         refresh.request("root", counting(&runs));
