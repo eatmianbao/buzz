@@ -30,9 +30,7 @@ use buzz_relay::telemetry;
 use buzz_workflow::WorkflowEngine;
 use tokio_util::sync::CancellationToken;
 
-/// Whether an opt-in boolean environment flag is on: `true`, `1`, `yes` or
-/// `on`, in any case. Unset, empty and every other value mean off.
-fn env_flag_enabled(value: Option<&str>) -> bool {
+fn buzz_auto_migrate_enabled(value: Option<&str>) -> bool {
     value.map(str::trim).is_some_and(|value| {
         matches!(
             value.to_ascii_lowercase().as_str(),
@@ -547,7 +545,8 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
         info!("Postgres connected");
     }
 
-    let auto_migrate = env_flag_enabled(std::env::var("BUZZ_AUTO_MIGRATE").ok().as_deref());
+    let auto_migrate =
+        buzz_auto_migrate_enabled(std::env::var("BUZZ_AUTO_MIGRATE").ok().as_deref());
     if auto_migrate {
         let step = StepTimer::start(StartupStep::DbMigrate);
         db.migrate().await.map_err(|e| {
@@ -1149,30 +1148,6 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
         }
     }
     step.finish();
-
-    // One-shot operator step after upgrading to computed `member`/`bot`
-    // labels: republish rosters that older relays published with the stored
-    // label. Off by default so no replica scans at every startup; both labels
-    // have the same permissions, so a stale one is only cosmetic until then.
-    if env_flag_enabled(std::env::var("BUZZ_RECONCILE_BOT_ROSTERS").ok().as_deref()) {
-        let role_roster_state = Arc::clone(&state);
-        tokio::spawn(async move {
-            match buzz_relay::handlers::side_effects::reconcile_ordinary_role_rosters(
-                &role_roster_state,
-            )
-            .await
-            {
-                Ok(summary) => info!(
-                    count = summary.repaired,
-                    failed = summary.failed,
-                    "member/bot channel rosters reconciled"
-                ),
-                Err(error) => {
-                    tracing::warn!(%error, "member/bot channel roster reconciliation failed")
-                }
-            }
-        });
-    }
 
     // Emit kind:39000/39002 discovery events for channels that exist in the DB
     // but don't have corresponding events (e.g. seeded via direct SQL inserts).
@@ -3138,8 +3113,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        apply_activity_refresh, apply_stock_refresh, connect_audit_pool, counted_partition_audit,
-        dropped_in_memory_keys, emit_cached_fleet_usage_metrics, env_flag_enabled,
+        apply_activity_refresh, apply_stock_refresh, buzz_auto_migrate_enabled, connect_audit_pool,
+        counted_partition_audit, dropped_in_memory_keys, emit_cached_fleet_usage_metrics,
         idle_timeout_secs, jwks_next_retry_after_failed_refresh, nip_fi_jwks_refresh_loop,
         record_legacy_usage_collection, refresh_due_fleet_usage,
         refresh_legacy_active_gauge_recency, relay_keypair_from_config,
@@ -3508,18 +3483,18 @@ mod tests {
     }
 
     #[test]
-    fn env_flags_are_opt_in() {
-        assert!(!env_flag_enabled(None));
-        assert!(!env_flag_enabled(Some("")));
-        assert!(!env_flag_enabled(Some("false")));
-        assert!(!env_flag_enabled(Some("0")));
-        assert!(!env_flag_enabled(Some("no")));
+    fn buzz_auto_migrate_is_opt_in() {
+        assert!(!buzz_auto_migrate_enabled(None));
+        assert!(!buzz_auto_migrate_enabled(Some("")));
+        assert!(!buzz_auto_migrate_enabled(Some("false")));
+        assert!(!buzz_auto_migrate_enabled(Some("0")));
+        assert!(!buzz_auto_migrate_enabled(Some("no")));
 
-        assert!(env_flag_enabled(Some("true")));
-        assert!(env_flag_enabled(Some("TRUE")));
-        assert!(env_flag_enabled(Some(" 1 ")));
-        assert!(env_flag_enabled(Some("yes")));
-        assert!(env_flag_enabled(Some("on")));
+        assert!(buzz_auto_migrate_enabled(Some("true")));
+        assert!(buzz_auto_migrate_enabled(Some("TRUE")));
+        assert!(buzz_auto_migrate_enabled(Some(" 1 ")));
+        assert!(buzz_auto_migrate_enabled(Some("yes")));
+        assert!(buzz_auto_migrate_enabled(Some("on")));
     }
 
     #[test]

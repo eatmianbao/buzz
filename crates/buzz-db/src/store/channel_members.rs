@@ -1615,117 +1615,6 @@ pub async fn list_large_channel_rosters_needing_reconciliation(
         .collect()
 }
 
-/// A channel whose live relay-authored kind:39002 roster shows an active
-/// ordinary member with the other label (`member` instead of `bot`, or the
-/// reverse) than [`member_role_label`] gives.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StaleRoleRoster {
-    /// Community that owns the channel.
-    pub community_id: CommunityId,
-    /// Canonical host for the owning community.
-    pub host: String,
-    /// Channel whose roster must be republished.
-    pub channel_id: Uuid,
-}
-
-/// Returns active channels whose live roster shows an ordinary member with
-/// the wrong `member`/`bot` label.
-///
-/// Such a roster exists when it was published before this release (older
-/// relays published the stored role), or when a relay stopped between
-/// recording an agent owner and republishing that agent's rosters. Only two
-/// kinds of channel can disagree, so only they are read: channels with an
-/// active ordinary member that has a recorded agent owner, and channels whose
-/// roster names someone `bot` (found through the `tags` GIN index). Only
-/// active communities are scanned, as in
-/// [`list_large_channel_rosters_needing_reconciliation`].
-///
-/// This is an internal cross-community maintenance read for the one-shot
-/// `BUZZ_RECONCILE_BOT_ROSTERS` startup step. Callers must preserve the
-/// returned community id when rewriting discovery state.
-pub async fn list_channel_rosters_with_stale_ordinary_roles(
-    pool: &PgPool,
-    relay_pubkey: &[u8],
-) -> Result<Vec<StaleRoleRoster>> {
-    let mut connection = crate::observability::acquire_writer(
-        pool,
-        crate::observability::WriterOperation::Maintenance,
-    )
-    .await?;
-    let rows = sqlx::query(concat!(
-        r#"
-        WITH candidates AS (
-            SELECT cm.community_id, cm.channel_id
-            FROM channel_members cm
-            JOIN users u
-              ON u.community_id = cm.community_id
-             AND u.pubkey = cm.pubkey
-             AND u.agent_owner_pubkey IS NOT NULL
-            WHERE cm.role IN ('member', 'bot') AND cm.removed_at IS NULL
-            UNION
-            SELECT roster.community_id, roster.channel_id
-            FROM events roster
-            WHERE roster.kind = 39002
-              AND roster.pubkey = $1
-              AND roster.deleted_at IS NULL
-              AND roster.channel_id IS NOT NULL
-              AND roster.tags @> '[["bot"]]'::jsonb
-        )
-        SELECT candidate.community_id, community.host, candidate.channel_id
-        FROM candidates candidate
-        JOIN channels ch
-          ON ch.community_id = candidate.community_id
-         AND ch.id = candidate.channel_id
-         AND ch.deleted_at IS NULL
-        JOIN communities community
-          ON community.id = candidate.community_id
-         AND community.archived_at IS NULL
-         AND community.deleted_at IS NULL
-         AND community.deletion_state = 'active'
-        JOIN LATERAL (
-            SELECT roster.tags
-            FROM events roster
-            WHERE roster.community_id = candidate.community_id
-              AND roster.channel_id = candidate.channel_id
-              AND roster.kind = 39002
-              AND roster.pubkey = $1
-              AND roster.deleted_at IS NULL
-            ORDER BY roster.created_at DESC, roster.id ASC
-            LIMIT 1
-        ) live_roster ON true
-        WHERE EXISTS (
-            SELECT 1
-            FROM channel_members cm
-            JOIN jsonb_array_elements(live_roster.tags) tag
-              ON tag->>0 = 'p'
-             AND tag->>1 = encode(cm.pubkey, 'hex')
-            WHERE cm.community_id = candidate.community_id
-              AND cm.channel_id = candidate.channel_id
-              AND cm.removed_at IS NULL
-              AND cm.role IN ('member', 'bot')
-              AND tag->>3 IN ('member', 'bot')
-              AND tag->>3 <> "#,
-        member_role_label!(),
-        r#"
-        )
-        ORDER BY candidate.community_id, candidate.channel_id
-        "#
-    ))
-    .bind(relay_pubkey)
-    .fetch_all(&mut *connection)
-    .await?;
-
-    rows.into_iter()
-        .map(|row| {
-            Ok(StaleRoleRoster {
-                community_id: CommunityId::from_uuid(row.try_get("community_id")?),
-                host: row.try_get("host")?,
-                channel_id: row.try_get("channel_id")?,
-            })
-        })
-        .collect()
-}
-
 /// The channels where `pubkey` is an active ordinary member (`member` or
 /// `bot`). Recording an agent owner changes the label these rows show, so
 /// their rosters are republished.
@@ -2386,19 +2275,6 @@ impl Db {
     ) -> Result<Vec<LargeChannelRoster>> {
         list_large_channel_rosters_needing_reconciliation(&self.pool, minimum_members, relay_pubkey)
             .await
-    }
-
-    /// Returns active-channel rosters that show an ordinary member with the
-    /// wrong `member`/`bot` label.
-    #[datastore_span(
-        name = "list_channel_rosters_with_stale_ordinary_roles",
-        system = "postgresql"
-    )]
-    pub async fn list_channel_rosters_with_stale_ordinary_roles(
-        &self,
-        relay_pubkey: &[u8],
-    ) -> Result<Vec<StaleRoleRoster>> {
-        list_channel_rosters_with_stale_ordinary_roles(&self.pool, relay_pubkey).await
     }
 
     /// Returns the channels where `pubkey` is an active ordinary member.
@@ -5407,11 +5283,9 @@ mod postgres_tests {
     /// The roster check treats `member` and `bot` as one role, so an owner
     /// recorded between roster capture and insert does not refuse the
     /// publication; the background republish then replaces the stale label.
-    /// The one-shot scan reports a roster with a stale label until then.
     ///
-    /// Mutations: compare labels exactly in `validate_channel_roster_snapshot`
-    /// → the captured roster is refused → RED; compare stored roles in the
-    /// scan → the stale roster is not reported → RED.
+    /// Mutation: compare labels exactly in `validate_channel_roster_snapshot`
+    /// → the captured roster is refused → RED.
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn owner_record_during_roster_publication_converges() {
@@ -5465,13 +5339,6 @@ mod postgres_tests {
             .await
             .expect("read live roster")
         };
-        let stale = || async {
-            list_channel_rosters_with_stale_ordinary_roles(&pool, &relay_pubkey)
-                .await
-                .expect("list stale rosters")
-                .iter()
-                .any(|c| c.channel_id == channel)
-        };
         let at = nostr::Timestamp::now().as_secs();
 
         let mut snapshot = db
@@ -5497,7 +5364,6 @@ mod postgres_tests {
         );
         snapshot.release().await.expect("commit captured roster");
         assert_eq!(agent_label(&live_tags().await).as_deref(), Some("member"));
-        assert!(stale().await, "the scan must report the stale label");
 
         // The background republish after the owner record.
         let mut snapshot = db
@@ -5511,7 +5377,6 @@ mod postgres_tests {
             .expect("republish");
         snapshot.release().await.expect("commit republish");
         assert_eq!(agent_label(&live_tags().await).as_deref(), Some("bot"));
-        assert!(!stale().await);
     }
 
     /// The republish after an owner record lists the agent's active ordinary

@@ -3754,36 +3754,6 @@ pub async fn reconcile_large_channel_member_snapshots(
     Ok(summary)
 }
 
-/// Republish rosters that show an ordinary member with the wrong
-/// `member`/`bot` label: rosters published by relays from before the label
-/// was computed, or left stale when a relay stopped between recording an
-/// agent owner and republishing that agent's rosters.
-///
-/// A one-shot operator step, run at startup only when
-/// `BUZZ_RECONCILE_BOT_ROSTERS` is set. Converged deployments find no
-/// candidates, so it only reads.
-pub async fn reconcile_ordinary_role_rosters(
-    state: &Arc<AppState>,
-) -> anyhow::Result<ReconcileSummary> {
-    let relay_pubkey = state.relay_keypair.public_key();
-    let candidates = state
-        .db
-        .list_channel_rosters_with_stale_ordinary_roles(&relay_pubkey.to_bytes())
-        .await?;
-    let summary = republish_roster_candidates(
-        state,
-        candidates
-            .into_iter()
-            .map(|candidate| (candidate.community_id, candidate.host, candidate.channel_id))
-            .collect(),
-        "ordinary role roster reconciliation failed",
-    )
-    .await;
-    metrics::counter!("buzz_channel_role_roster_reconciliations_total")
-        .increment(summary.repaired as u64);
-    Ok(summary)
-}
-
 /// Republish each `(community, host, channel)` roster under its membership
 /// lock, counting failures instead of stopping. Each roster first takes a
 /// relay-wide republish permit, so concurrent callers share a small bound on
@@ -3847,8 +3817,7 @@ async fn republish_roster_candidates(
 /// wait: first AUTH must finish inside its own deadline. A failure is logged
 /// and counted and does not stop the other channels. A roster left stale (for
 /// example by a relay that stopped first) shows only the wrong label, which
-/// has the same permissions; the next membership change or a
-/// `BUZZ_RECONCILE_BOT_ROSTERS` startup repairs it.
+/// has the same permissions; the next membership change repairs it.
 pub fn spawn_agent_roster_republish(tenant: &TenantContext, state: Arc<AppState>, agent: Vec<u8>) {
     let (community_id, host) = (tenant.community(), tenant.host().to_owned());
     tokio::spawn(async move {
