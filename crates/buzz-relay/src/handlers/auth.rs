@@ -2338,10 +2338,13 @@ mod tests {
         /// a contended roster lock must not hold AUTH: the pending AUTH
         /// expires after 5 s, the same as the default lock timeout. The
         /// republish also waits for a relay-wide permit, so a burst of first
-        /// sign-ins holds only a few writer connections.
+        /// sign-ins holds only a few writer connections. While every permit
+        /// is held, the republish waits on the permit before it reaches the
+        /// roster lock, so AUTH is checked against the whole republish rather
+        /// than the lock alone.
         ///
         /// Mutations: await the roster republish inside
-        /// `materialize_nip_oa_owner` → AUTH waits on the held lock → RED;
+        /// `materialize_nip_oa_owner` → AUTH waits on the held permits → RED;
         /// skip the republish permit → the roster changes while every permit
         /// is held → RED.
         #[tokio::test]

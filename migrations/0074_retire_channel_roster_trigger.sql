@@ -7,9 +7,9 @@
 -- later before this migration runs; older relays refuse to start without the
 -- trigger. Published migrations remain checksum-frozen.
 --
--- DROP TRIGGER takes ACCESS EXCLUSIVE on the partitioned parent and on each
--- partition in turn, and keeps each lock while it waits for the next. While
--- the locks are queued or held, event reads and writes both block.
+-- DROP TRIGGER takes ACCESS EXCLUSIVE on each partition of events in turn,
+-- and keeps each lock while it waits for the next. While the locks are queued
+-- or held, event reads and writes both block.
 -- lock_timeout bounds each lock wait and statement_timeout bounds each whole
 -- statement, as in 0049. Either timeout rolls the migration back with no
 -- change, and it can be retried.

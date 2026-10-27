@@ -526,6 +526,31 @@ impl LockedMemberSnapshot {
     }
 }
 
+/// Refuse to serve until migration 0074 has retired the 0032 roster trigger.
+///
+/// This relay shows the computed `member`/`bot` label in kind:39002 rosters.
+/// The 0032 trigger compares roster labels with the stored role exactly, so
+/// while it is installed it refuses every roster that shows `bot` for a stored
+/// `member`. Membership changes would still commit, but those channels'
+/// rosters would stop updating.
+pub async fn verify_channel_roster_trigger_retired<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+) -> Result<()> {
+    let installed: bool = sqlx::query_scalar(
+        "SELECT to_regprocedure('public.guard_channel_roster_snapshot()') IS NOT NULL \
+         OR EXISTS (SELECT 1 FROM pg_trigger \
+                    WHERE tgname = 'trg_events_guard_channel_roster_snapshot')",
+    )
+    .fetch_one(executor)
+    .await?;
+    if installed {
+        return Err(DbError::InvalidData(
+            "the 0032 channel roster trigger is still installed; apply migration 0074".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Capture all active members while holding the same per-channel lock used by
 /// membership writers.
 ///
@@ -2115,6 +2140,18 @@ pub async fn get_member_role(
 }
 
 impl Db {
+    /// Fail unless migration 0074 has retired the 0032 roster trigger. See
+    /// [`verify_channel_roster_trigger_retired`].
+    #[datastore_span(name = "verify_channel_roster_trigger_retired", system = "postgresql")]
+    pub async fn verify_channel_roster_trigger_retired(&self) -> Result<()> {
+        let mut connection = crate::observability::acquire_writer(
+            &self.pool,
+            crate::observability::WriterOperation::Bootstrap,
+        )
+        .await?;
+        verify_channel_roster_trigger_retired(&mut *connection).await
+    }
+
     /// Capture the active roster while holding the membership-writer lock.
     #[datastore_span(name = "lock_member_snapshot", system = "postgresql")]
     pub async fn lock_member_snapshot(
@@ -5056,12 +5093,6 @@ mod postgres_tests {
         (pool, name)
     }
 
-    /// Create a fresh scratch database on the same server and run all migrations.
-    /// Returns (pool, db_name); callers should `drop_scratch_db` when done.
-    async fn create_scratch_db(admin: &PgPool, prefix: &str) -> (PgPool, String) {
-        create_scratch_db_through(admin, prefix, None).await
-    }
-
     async fn drop_scratch_db(admin: &PgPool, pool: PgPool, name: &str) {
         pool.close().await;
         let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -5103,10 +5134,13 @@ mod postgres_tests {
 
     /// Migration 0074 retires the 0032 roster trigger: after migrating, the
     /// database accepts a raw kind:39002 insert that disagrees with
-    /// membership, because only the app-side check guards rosters now.
+    /// membership, because only the app-side check guards rosters now. The
+    /// startup check refuses a database where the trigger is still
+    /// installed and accepts it after 0074.
     ///
-    /// Mutation: remove the DROP statements from 0074 → the trigger refuses
-    /// the insert → RED.
+    /// Mutations: remove the DROP statements from 0074 → the trigger refuses
+    /// the insert → RED; make the startup check always pass → the pre-0074
+    /// database is accepted → RED.
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn migrations_retire_the_roster_trigger() {
@@ -5115,7 +5149,23 @@ mod postgres_tests {
         let admin = PgPool::connect(&admin_url().await)
             .await
             .expect("connect admin");
-        let (pool, scratch_name) = create_scratch_db(&admin, "roster_fence_retired").await;
+        let (pool, scratch_name) =
+            create_scratch_db_through(&admin, "roster_fence_retired", Some(73)).await;
+        let db = Db::from_pool(pool.clone());
+        let error = db
+            .verify_channel_roster_trigger_retired()
+            .await
+            .expect_err("before 0074 the trigger is installed");
+        assert!(
+            error.to_string().contains("apply migration 0074"),
+            "the startup check must name the missing migration: {error}"
+        );
+        migration::run_migrations(&pool)
+            .await
+            .expect("apply migration 0074");
+        db.verify_channel_roster_trigger_retired()
+            .await
+            .expect("0074 retires the trigger");
         let function: Option<String> = sqlx::query_scalar(
             "SELECT to_regprocedure('public.guard_channel_roster_snapshot()')::text",
         )
