@@ -198,7 +198,11 @@ mod tests {
         settle().await;
         assert!(!refresh.pending.is_empty(), "the hung run holds the key");
 
-        tokio::time::advance(TIMEOUT + INTERVAL).await;
+        // Step one timer at a time: the cooldown sleep is armed only after
+        // the timeout fires, so a single jump would overshoot it.
+        tokio::time::advance(TIMEOUT).await;
+        settle().await;
+        tokio::time::advance(INTERVAL).await;
         settle().await;
         assert!(
             refresh.pending.is_empty(),
