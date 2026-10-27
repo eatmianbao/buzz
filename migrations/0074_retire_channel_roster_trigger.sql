@@ -7,10 +7,14 @@
 -- later before this migration runs; older relays refuse to start without the
 -- trigger. Published migrations remain checksum-frozen.
 --
--- DROP TRIGGER locks the partitioned parent and its partitions. Bound the
--- lock acquisition wait. This does not bound statement duration or the time
--- ingestion can be blocked while these locks are held.
-SET LOCAL lock_timeout = '5s';
+-- DROP TRIGGER takes ACCESS EXCLUSIVE on the partitioned parent and on each
+-- partition in turn, and keeps each lock while it waits for the next. While
+-- the locks are queued or held, event reads and writes both block.
+-- lock_timeout bounds each lock wait and statement_timeout bounds each whole
+-- statement, as in 0049. Either timeout rolls the migration back with no
+-- change, and it can be retried.
+SET LOCAL lock_timeout = '1s';
+SET LOCAL statement_timeout = '5s';
 
 DROP TRIGGER trg_events_guard_channel_roster_snapshot ON events;
 DROP FUNCTION guard_channel_roster_snapshot();

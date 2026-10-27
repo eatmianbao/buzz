@@ -2336,10 +2336,14 @@ mod tests {
         /// First AUTH with a NIP-OA credential records the owner, which makes
         /// the agent's ordinary rows show `bot`. The rosters must follow, but
         /// a contended roster lock must not hold AUTH: the pending AUTH
-        /// expires after 5 s, the same as the default lock timeout.
+        /// expires after 5 s, the same as the default lock timeout. The
+        /// republish also waits for a relay-wide permit, so a burst of first
+        /// sign-ins holds only a few writer connections.
         ///
-        /// Mutation: await the roster republish inside
-        /// `materialize_nip_oa_owner` → AUTH waits on the held lock → RED.
+        /// Mutations: await the roster republish inside
+        /// `materialize_nip_oa_owner` → AUTH waits on the held lock → RED;
+        /// skip the republish permit → the roster changes while every permit
+        /// is held → RED.
         #[tokio::test]
         #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
         async fn first_auth_is_not_held_by_a_contended_roster_lock() {
@@ -2381,7 +2385,12 @@ mod tests {
                 .await
                 .expect("add unowned agent");
 
-            // Hold the roster lock the republish needs.
+            // Hold every republish permit and the roster lock the republish
+            // needs.
+            let permits = Arc::clone(&state.roster_republish_semaphore)
+                .acquire_many_owned(crate::state::ROSTER_REPUBLISH_CONCURRENCY as u32)
+                .await
+                .expect("hold every republish permit");
             let relay_pubkey = state.relay_keypair.public_key().to_bytes();
             let held = state
                 .db
@@ -2417,12 +2426,8 @@ mod tests {
                 .await
                 .expect("read owner"));
 
-            // Once the lock is free, the background republish names the agent
-            // `bot` in the live roster.
-            held.release().await.expect("release roster lock");
             let agent_hex = agent.public_key().to_hex();
-            let deadline = Instant::now() + std::time::Duration::from_secs(10);
-            loop {
+            let live_roster = || async {
                 let live: Option<serde_json::Value> = sqlx::query_scalar(
                     "SELECT tags FROM events WHERE community_id = $1 AND channel_id = $2 \
                      AND kind = 39002 AND deleted_at IS NULL",
@@ -2432,15 +2437,34 @@ mod tests {
                 .fetch_optional(state.db.pool())
                 .await
                 .expect("read live roster");
-                let is_bot = live
-                    .as_ref()
+                live
+            };
+            let shows_bot = |live: &Option<serde_json::Value>| {
+                live.as_ref()
                     .and_then(|tags| tags.as_array())
                     .is_some_and(|tags| {
                         tags.iter().any(|tag| {
                             tag[0] == "p" && tag[1] == agent_hex.as_str() && tag[3] == "bot"
                         })
-                    });
-                if is_bot {
+                    })
+            };
+
+            // With the roster lock free but every permit held, the republish
+            // still waits.
+            held.release().await.expect("release roster lock");
+            let before = live_roster().await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let waiting = live_roster().await;
+            assert_eq!(waiting, before, "no republish runs without a permit");
+            assert!(!shows_bot(&waiting), "{waiting:?}");
+
+            // Once a permit is free, the background republish names the agent
+            // `bot` in the live roster.
+            drop(permits);
+            let deadline = Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let live = live_roster().await;
+                if shows_bot(&live) {
                     break;
                 }
                 assert!(

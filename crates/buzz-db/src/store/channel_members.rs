@@ -42,6 +42,12 @@ pub struct MemberRecord {
 /// `owner`, `admin` and `guest` show as stored. An agent owner is recorded
 /// once and never changes, so the label of a key changes at most once.
 ///
+/// One exception: the `users` foreign key to the owner is `ON DELETE SET
+/// NULL`, so deleting the owner's `users` row clears the agent's owner. Today
+/// only community deletion deletes `users` rows, and it removes every row of
+/// the community. A user deletion that purges `users` rows must republish the
+/// rosters of the deleted owner's agents, or they keep showing `bot`.
+///
 /// Every read of a member's role uses this, so rosters, member lists and role
 /// checks agree.
 macro_rules! member_role_label {

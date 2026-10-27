@@ -775,7 +775,8 @@ mod postgres_tests {
         assert_eq!(migrations[73].version, 74);
         let retire_roster_fence = strip_sql_comments(migrations[73].sql.as_str());
         for statement in [
-            "SET LOCAL lock_timeout = '5s';",
+            "SET LOCAL lock_timeout = '1s';",
+            "SET LOCAL statement_timeout = '5s';",
             "DROP TRIGGER trg_events_guard_channel_roster_snapshot ON events;",
             "DROP FUNCTION guard_channel_roster_snapshot();",
         ] {

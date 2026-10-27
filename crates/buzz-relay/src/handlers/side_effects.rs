@@ -3785,7 +3785,9 @@ pub async fn reconcile_ordinary_role_rosters(
 }
 
 /// Republish each `(community, host, channel)` roster under its membership
-/// lock, counting failures instead of stopping.
+/// lock, counting failures instead of stopping. Each roster first takes a
+/// relay-wide republish permit, so concurrent callers share a small bound on
+/// the writer connections they hold.
 async fn republish_roster_candidates(
     state: &Arc<AppState>,
     candidates: Vec<(buzz_core::CommunityId, String, uuid::Uuid)>,
@@ -3798,6 +3800,9 @@ async fn republish_roster_candidates(
 
     for (community_id, host, channel_id) in candidates {
         let result = async {
+            let _permit = Arc::clone(&state.roster_republish_semaphore)
+                .acquire_owned()
+                .await?;
             // Hold the membership-writer lock from roster capture through
             // replacement. Otherwise a rolling deployment can publish stale
             // roster A after another relay commits and publishes roster B.
